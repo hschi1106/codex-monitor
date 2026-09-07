@@ -1,0 +1,25 @@
+[[accounts]]
+name = "Main"
+executable = "codex"
+
+[[accounts]]
+name = "Alt"
+executable = "codex"
+environment = { CODEX_HOME = "/home/hschi1106/.codex-alt" }
+
+[monitor]
+terminal_rows = 80
+terminal_cols = 120
+startup_timeout_seconds = 45
+status_timeout_seconds = 25
+refresh_pause_seconds = 4
+overall_timeout_seconds = 150
+
+[schedule]
+interval_minutes = 30
+
+[discord]
+webhook_env = "DISCORD_WEBHOOK_URL"
+request_timeout_seconds = 20
+status_font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+status_font_size = 18.0

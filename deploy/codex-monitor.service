@@ -1,0 +1,17 @@
+[Unit]
+Description=Codex usage monitor for Discord
+Documentation=file:///home/hschi1106/codex-monitor/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hschi1106/codex-monitor
+ExecStart=/home/hschi1106/codex-monitor/target/release/codex-monitor --config /home/hschi1106/codex-monitor/config.toml
+EnvironmentFile=%h/.config/codex-monitor/env
+Environment=PATH=/home/hschi1106/.nvm/versions/node/v24.13.1/bin:/home/hschi1106/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

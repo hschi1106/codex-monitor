@@ -1,0 +1,26 @@
+# Rust build output
+/target/
+
+# Secrets and machine-local environment files
+.env
+.env.*
+!.env.example
+*.local.env
+/deploy/*.env
+.envrc
+.direnv/
+
+# Optional machine-local configuration overrides
+config.local.toml
+config.*.local.toml
+
+# Logs, coverage, editor and OS files
+*.log
+/coverage/
+/tarpaulin-report.html
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*.rs.bk
