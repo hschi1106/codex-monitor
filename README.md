@@ -1,9 +1,11 @@
 # Codex Usage Monitor
 
-[![Rust 2024](https://img.shields.io/badge/Rust-2024_Edition-000000?logo=rust)](https://www.rust-lang.org/)
-[![Platform](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)](#requirements)
-[![License](https://img.shields.io/github/license/hschi1106/codex-monitor)](LICENSE)
-[![Last commit](https://img.shields.io/github/last-commit/hschi1106/codex-monitor)](https://github.com/hschi1106/codex-monitor/commits/main)
+<p align="center">
+  <a href="https://www.rust-lang.org/"><img alt="Rust 2024" src="https://img.shields.io/badge/Rust-2024_Edition-000000?logo=rust"></a>
+  <a href="#requirements"><img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&amp;logoColor=black"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/hschi1106/codex-monitor"></a>
+  <a href="https://github.com/hschi1106/codex-monitor/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/hschi1106/codex-monitor"></a>
+</p>
 
 Monitor `/status` across multiple local Codex CLI accounts and deliver complete,
 readable status cards to Discord.
