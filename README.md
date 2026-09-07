@@ -26,6 +26,27 @@ incoming webhook.
 > This is an unofficial community project and is not affiliated with or
 > supported by OpenAI.
 
+## Why this exists
+
+Codex's displayed 5-hour limit can remain stale after its stated reset time,
+especially when an account has been idle. In observed use, opening Codex again
+can trigger an asynchronous refresh before the restored capacity becomes
+visible.
+
+Codex Usage Monitor handles that behavior proactively. On every scheduled
+cycle it opens each account, runs `/status` three times in the same session with
+refresh pauses in between, and records only the final rendered card. Combined
+with the default `HH:00` and `HH:30` schedule, the service both monitors
+remaining capacity and regularly triggers a usage-state refresh for otherwise
+idle accounts.
+
+This is particularly useful with multiple accounts because they stay refreshed
+without manually opening each Codex session.
+
+> [!IMPORTANT]
+> This workaround is based on observed Codex CLI behavior, not a documented or
+> guaranteed API contract. Codex rate-limit handling may change over time.
+
 ## Features
 
 - Monitor any number of independently authenticated Codex accounts
