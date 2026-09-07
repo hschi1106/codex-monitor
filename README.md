@@ -1,35 +1,91 @@
 # codex-monitor
 
-`codex-monitor` opens a real Codex CLI TUI for each configured local account,
-runs `/status` three times in that same session, and reports the complete third
-status card locally and through a Discord webhook. A VT100 terminal emulator
-reconstructs the screen, so PTY escape sequences never reach logs or reports.
+A small Rust service that monitors `/status` for multiple local Codex CLI
+accounts and sends each account's status to Discord.
 
-The service reads `config.toml` by default. The supplied configuration contains:
+Codex `/status` is an interactive TUI command, so this project launches Codex
+inside a pseudo-terminal and reconstructs the terminal with a VT100 parser. It
+runs `/status` three times in the same session to allow Codex's asynchronous
+rate-limit refresh to finish, then keeps the complete third status card.
 
-| Name | Executable | Environment |
-| --- | --- | --- |
-| Main | `codex` | Uses the process's default `CODEX_HOME` |
-| Alt | `codex` | `CODEX_HOME=/home/hschi1106/.codex-alt` |
+Each successful Discord notification contains only an account title, a PNG of
+the full Codex card, and the original UTF-8 card as a `.txt` attachment. The
+image scales cleanly in Discord without breaking terminal borders. Account
+failures are reported separately and do not stop the remaining accounts.
 
-Both entries invoke the actual `codex` command directly; shell aliases are not
-used. Add another `[[accounts]]` table to monitor another identity:
+## Features
+
+- Any number of independently configured local Codex accounts
+- Per-account executable and environment variables such as `CODEX_HOME`
+- Real PTY interaction with no dependency on shell aliases
+- VT100 screen reconstruction instead of parsing raw escape sequences
+- Three `/status` refreshes in one Codex session
+- Per-account startup, status, and overall timeouts
+- Discord incoming webhook delivery with PNG and TXT attachments
+- Local wall-clock scheduling without interval drift
+- Clean child-process, process-group, PTY, and reader-thread cleanup
+- One-shot local testing and a supplied systemd user service
+
+## Requirements
+
+- Rust toolchain with Cargo
+- A working `codex` command
+- Each configured Codex account already authenticated
+- A monospaced TrueType font; the supplied configuration uses DejaVu Sans Mono
+- A Discord incoming webhook for notifications
+- Linux and systemd if using the supplied service unit
+
+## Quick start
+
+Clone and build:
+
+```sh
+git clone https://github.com/hschi1106/codex-monitor.git
+cd codex-monitor
+cargo build --release
+```
+
+Configure the accounts in `config.toml`. The supplied configuration monitors
+the normal Codex account and one alternate account:
 
 ```toml
 [[accounts]]
-name = "Work"
+name = "Main"
 executable = "codex"
-environment = { CODEX_HOME = "/home/me/.codex-work" }
+
+[[accounts]]
+name = "Alt"
+executable = "codex"
+environment = { CODEX_HOME = "/home/hschi1106/.codex-alt" }
 ```
 
-`environment` accepts any per-account environment variables. Omit it for the
-normal Codex account. Authenticate each alternate account using the same
-`CODEX_HOME` before running the monitor.
+Authenticate the alternate account before starting the monitor:
 
-The other configuration sections control PTY dimensions, timeouts, the pause
-between rate-limit refreshes, the wall-clock interval, and Discord transport:
+```sh
+CODEX_HOME=/home/hschi1106/.codex-alt codex
+```
+
+Run one cycle locally without Discord:
+
+```sh
+./target/release/codex-monitor --config config.toml --once --no-discord
+```
+
+## Configuration
+
+The program reads `config.toml` by default. Use another file with
+`--config /path/to/config.toml`.
 
 ```toml
+[[accounts]]
+name = "Main"
+executable = "codex"
+
+[[accounts]]
+name = "Alt"
+executable = "codex"
+environment = { CODEX_HOME = "/home/hschi1106/.codex-alt" }
+
 [monitor]
 terminal_rows = 80
 terminal_cols = 120
@@ -48,131 +104,141 @@ status_font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 status_font_size = 18.0
 ```
 
-The interval must be a positive divisor of 60, such as 5, 10, 15, 20, 30, or
-60. The three `/status` calls are deliberately fixed because the third rendered
-snapshot is the authoritative result.
+`environment` accepts arbitrary per-account variables. Omit it for the default
+Codex account. The schedule interval must be a positive divisor of 60, such as
+5, 10, 15, 20, 30, or 60. A 30-minute schedule runs at `HH:00` and `HH:30`.
+
+The monitor always performs exactly three `/status` commands because the third
+rendered card is the authoritative snapshot.
 
 ## Discord setup
 
-In Discord, open the destination channel's **Edit Channel → Integrations →
-Webhooks**, create a webhook, and copy its URL. Export it only in the monitor's
-runtime environment:
+1. In Discord, open **Server Settings → Integrations → Webhooks**.
+2. Create a webhook, choose the destination channel, and copy its URL.
+3. Create a private environment file outside the repository:
 
 ```sh
-export DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/...'
+mkdir -p ~/.config/codex-monitor
+cp deploy/codex-monitor.env.example ~/.config/codex-monitor/env
+chmod 600 ~/.config/codex-monitor/env
 ```
 
-The URL is never stored in this repository. Webhook failures are logged and do
-not stop later accounts or scheduled cycles. Discord receives one message per
-account containing only the account title, a PNG rendering that scales without
-breaking the terminal layout, and the complete authoritative card as a `.txt`
-attachment. If image rendering fails, the monitor falls back to lossless code
-blocks and Discord-safe splitting.
+Edit `~/.config/codex-monitor/env` and replace `REPLACE_ME`:
 
-## Running
+```text
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/REPLACE_ME
+```
 
-Run every configured account immediately, print the clean report, send it to
-Discord, and exit:
+Never commit the real webhook URL. If it is exposed, delete or regenerate it in
+Discord.
+
+Load the environment and perform an immediate end-to-end test:
 
 ```sh
-cargo run -- --once
+set -a
+source ~/.config/codex-monitor/env
+set +a
+./target/release/codex-monitor --config config.toml --once
 ```
 
-Test locally without sending a webhook:
+Discord should receive one message per account. Each successful message has the
+title `Codex Usage Monitor — <account>`, a PNG preview, and a complete TXT
+attachment.
 
-```sh
-cargo run -- --once --no-discord
+## Command reference
+
+| Command | Purpose |
+| --- | --- |
+| `cargo run -- --once` | Run immediately, send to Discord, then exit |
+| `cargo run -- --once --no-discord` | Run immediately and print locally only |
+| `cargo run` | Wait for each configured wall-clock boundary and run continuously |
+| `cargo run -- --config FILE` | Use a different configuration file |
+| `CODEX_MONITOR_DEBUG_SCREEN=1 cargo run -- --once --no-discord` | Print the reconstructed screen when capture times out |
+
+Operational progress is written separately from the clean report:
+
+```text
+[Main] starting Codex
+[Main] TUI ready
+[Main] /status refresh 1/3
+[Main] /status refresh 2/3
+[Main] /status refresh 3/3
+[Main] status captured
 ```
 
-Use a different configuration file with:
+## Run continuously with systemd
 
-```sh
-cargo run -- --config /path/to/monitor.toml --once --no-discord
-```
-
-For PTY troubleshooting, `CODEX_MONITOR_DEBUG_SCREEN=1` prints the clean
-reconstructed screen only when a `/status` capture times out. It never prints
-the raw PTY stream.
-
-Run continuously with:
-
-```sh
-cargo run --release
-```
-
-With the supplied 30-minute configuration, continuous mode waits for the next
-local wall-clock `HH:00` or `HH:30` boundary, runs one cycle, then calculates
-the following boundary. Runtime and restart time therefore do not cause
-schedule drift.
-
-## Run continuously with systemd on this machine
-
-Build the executable once, install the supplied user service, and create its
-private environment file:
+The supplied unit is configured for this machine at
+`/home/hschi1106/codex-monitor`. Build the release binary and install the user
+service:
 
 ```sh
 cd /home/hschi1106/codex-monitor
 cargo build --release
-mkdir -p ~/.config/codex-monitor ~/.config/systemd/user
-cp deploy/codex-monitor.env.example ~/.config/codex-monitor/env
+mkdir -p ~/.config/systemd/user ~/.config/codex-monitor
 cp deploy/codex-monitor.service ~/.config/systemd/user/codex-monitor.service
+cp -n deploy/codex-monitor.env.example ~/.config/codex-monitor/env
 chmod 600 ~/.config/codex-monitor/env
-```
-
-Edit `~/.config/codex-monitor/env` and replace `REPLACE_ME` with the Discord
-webhook URL. Then enable and start the service:
-
-```sh
 systemctl --user daemon-reload
 systemctl --user enable --now codex-monitor.service
-systemctl --user status codex-monitor.service
 ```
 
-Follow its logs with:
+Ensure `~/.config/codex-monitor/env` contains the real webhook URL. Allow the
+user service to run after logout and start during boot:
 
 ```sh
-journalctl --user -u codex-monitor.service -f
+loginctl enable-linger "$USER"
 ```
 
-To keep the user service running after logout and start it during boot, enable
-systemd lingering once:
+Basic service commands:
 
-```sh
-sudo loginctl enable-linger hschi1106
-```
+| Command | Purpose |
+| --- | --- |
+| `systemctl --user status codex-monitor.service --no-pager` | Check service health |
+| `journalctl --user -u codex-monitor.service -f` | Follow live logs; `Ctrl+C` only exits the log viewer |
+| `journalctl --user -u codex-monitor.service -n 100 --no-pager` | Show the latest 100 log lines |
+| `systemctl --user restart codex-monitor.service` | Restart after configuration changes |
+| `systemctl --user stop codex-monitor.service` | Stop monitoring |
+| `systemctl --user start codex-monitor.service` | Start monitoring again |
+| `systemctl --user disable --now codex-monitor.service` | Stop and disable automatic startup |
 
-After changing Rust code, rebuild and restart it:
+After changing Rust code, rebuild before restarting:
 
 ```sh
 cargo build --release
 systemctl --user restart codex-monitor.service
 ```
 
-After changing only `config.toml`, restart the service without rebuilding. Stop
-or permanently disable it with `systemctl --user stop codex-monitor.service` or
-`systemctl --user disable --now codex-monitor.service`.
+After changing only `config.toml`, restart without rebuilding. Avoid running a
+manual continuous instance alongside systemd, or every cycle may be delivered
+twice.
 
-## Output
+## Troubleshooting
 
-Local output contains one logical report with every account. Discord sends each
-account as its own title-only message with PNG and TXT attachments:
+Check the service, the schedule, and recent errors:
 
-````text
-**Codex Usage Monitor**
-Timestamp: 2026-09-07 21:30 +08:00
-
-**Main**
-```text
-╭────────────────────────────────────────────────╮
-│  >_ OpenAI Codex (...)                         │
-│  Model: ...                                    │
-│  ...every row rendered by Codex /status...     │
-│  Weekly limit: [████████████░░░░] ...          │
-╰────────────────────────────────────────────────╯
+```sh
+systemctl --user status codex-monitor.service --no-pager
+journalctl --user -u codex-monitor.service -n 100 --no-pager
+loginctl show-user "$USER" -p Linger
 ```
-````
 
-If an account fails or times out, its section contains a clear error while
-successful account cards remain in the report. Codex startup, each `/status`,
-and the overall account operation have independent deadlines, and the process
-group and PTY reader are cleaned up after every account.
+If `codex` cannot be found under systemd, update the `PATH` in
+`deploy/codex-monitor.service`, copy the unit again, and reload systemd. The
+supplied unit includes the Codex path currently used on this machine.
+
+If PNG generation fails, verify `discord.status_font_path`. The monitor falls
+back to complete text code blocks so status data is still delivered.
+
+## Development
+
+```sh
+cargo fmt -- --check
+cargo check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+## License
+
+Licensed under the [MIT License](LICENSE).
