@@ -12,8 +12,9 @@ terminal_rows = 80
 terminal_cols = 120
 startup_timeout_seconds = 45
 status_timeout_seconds = 25
+model_turn_timeout_seconds = 90
 refresh_pause_seconds = 4
-overall_timeout_seconds = 150
+overall_timeout_seconds = 300
 
 [schedule]
 interval_minutes = 30

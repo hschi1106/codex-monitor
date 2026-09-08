@@ -6,6 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, Local, LocalResult, NaiveDateTime, NaiveTime,
+    TimeZone,
+};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::accounts::Account;
@@ -18,6 +22,7 @@ pub struct MonitorSettings {
     pub terminal_cols: u16,
     pub startup: Duration,
     pub status: Duration,
+    pub model_turn: Duration,
     pub refresh_pause: Duration,
     pub overall: Duration,
 }
@@ -29,8 +34,31 @@ impl Default for MonitorSettings {
             terminal_cols: 120,
             startup: Duration::from_secs(45),
             status: Duration::from_secs(25),
+            model_turn: Duration::from_secs(90),
             refresh_pause: Duration::from_secs(4),
-            overall: Duration::from_secs(150),
+            overall: Duration::from_secs(300),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AccountState {
+    previous_five_hour_reset: Option<DateTime<Local>>,
+    previous_observed_at: Option<DateTime<Local>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AnchorOutcome {
+    NotNeeded,
+    AnchoredAutomatically,
+    Failed(String),
+}
+
+impl AnchorOutcome {
+    pub fn failure_message(&self) -> Option<&str> {
+        match self {
+            Self::Failed(message) => Some(message),
+            Self::NotNeeded | Self::AnchoredAutomatically => None,
         }
     }
 }
@@ -45,12 +73,23 @@ pub struct CodexStatus {
     #[allow(dead_code)]
     // Retained for future alert thresholds; rendered_status stays authoritative.
     pub weekly_percent_left: Option<u8>,
+    pub five_hour_reset_at: Option<DateTime<Local>>,
+    pub anchor_outcome: AnchorOutcome,
 }
 
 #[derive(Debug, Clone)]
 pub enum AccountResult {
     Success(CodexStatus),
     Failure { account_name: String, error: String },
+}
+
+impl AccountResult {
+    pub fn account_name(&self) -> &str {
+        match self {
+            Self::Success(status) => &status.account_name,
+            Self::Failure { account_name, .. } => account_name,
+        }
+    }
 }
 
 struct TerminalState {
@@ -235,6 +274,54 @@ impl Session {
         }
     }
 
+    fn request_anchor_turn(&mut self, timeout: Duration, overall_deadline: Instant) -> Result<()> {
+        const ANCHOR_PROMPT: &str = "Reply only OK. Do not use tools.";
+
+        let (before, starting_revision, _) = self.snapshot()?;
+        for byte in ANCHOR_PROMPT.bytes() {
+            self.writer
+                .as_mut()
+                .context("PTY writer is unavailable")?
+                .write_all(&[byte])?;
+            self.writer.as_mut().unwrap().flush()?;
+            thread::sleep(Duration::from_millis(12));
+        }
+
+        let deadline = deadline_for(timeout, overall_deadline);
+        loop {
+            let (screen, _, _) = self.snapshot()?;
+            if screen.contains(ANCHOR_PROMPT) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                self.print_debug_screen(&screen, "waiting for Codex to accept anchor input");
+                bail!("timed out waiting for Codex to accept anchor input");
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        self.writer.as_mut().unwrap().write_all(b"\x1b[13u")?;
+        self.writer.as_mut().unwrap().flush()?;
+        let sent_at = Instant::now();
+
+        loop {
+            let (screen, revision, last_update) = self.snapshot()?;
+            let completed = revision > starting_revision
+                && screen != before
+                && screen.contains(READY_MARKER)
+                && sent_at.elapsed() >= Duration::from_secs(1)
+                && last_update.elapsed() >= Duration::from_millis(750);
+            if completed {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                self.print_debug_screen(&screen, "waiting for anchor model turn completion");
+                bail!("timed out waiting for anchor model turn completion");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn print_debug_screen(&self, screen: &str, operation: &str) {
         if std::env::var_os("CODEX_MONITOR_DEBUG_SCREEN").is_some() {
             eprintln!(
@@ -312,7 +399,26 @@ impl Drop for Session {
     }
 }
 
-pub fn monitor_account(account: &Account, settings: &MonitorSettings) -> Result<CodexStatus> {
+trait CodexInteraction {
+    fn status_card(&mut self, timeout: Duration, overall_deadline: Instant) -> Result<String>;
+    fn anchor_turn(&mut self, timeout: Duration, overall_deadline: Instant) -> Result<()>;
+}
+
+impl CodexInteraction for Session {
+    fn status_card(&mut self, timeout: Duration, overall_deadline: Instant) -> Result<String> {
+        self.request_status(timeout, overall_deadline)
+    }
+
+    fn anchor_turn(&mut self, timeout: Duration, overall_deadline: Instant) -> Result<()> {
+        self.request_anchor_turn(timeout, overall_deadline)
+    }
+}
+
+pub fn monitor_account(
+    account: &Account,
+    settings: &MonitorSettings,
+    state: &mut AccountState,
+) -> Result<CodexStatus> {
     eprintln!("[{}] starting Codex", account.name);
     let overall_deadline = Instant::now() + settings.overall;
     let mut session = Session::start(account, settings)?;
@@ -321,30 +427,152 @@ pub fn monitor_account(account: &Account, settings: &MonitorSettings) -> Result<
         session.wait_until_ready(settings.startup, overall_deadline)?;
         eprintln!("[{}] TUI ready", account.name);
 
-        let mut authoritative = None;
-        for refresh in 1..=3 {
-            ensure_before(overall_deadline, "overall account monitoring")?;
-            eprintln!("[{}] /status refresh {refresh}/3", account.name);
-            let rendered = session.request_status(settings.status, overall_deadline)?;
-            if refresh == 3 {
-                authoritative = Some(rendered);
-            } else {
-                sleep_until(settings.refresh_pause, overall_deadline)?;
-            }
-        }
-
-        let rendered_status = authoritative.context("third /status snapshot was not captured")?;
-        eprintln!("[{}] status captured", account.name);
-        Ok(CodexStatus {
-            account_name: account.name.clone(),
-            five_hour_percent_left: parse_percent_left(&rendered_status, "5h limit:"),
-            weekly_percent_left: parse_percent_left(&rendered_status, "Weekly limit:"),
-            rendered_status,
-        })
+        monitor_interaction(
+            &mut session,
+            &account.name,
+            settings,
+            state,
+            overall_deadline,
+        )
     })();
 
     session.shutdown();
     result
+}
+
+fn monitor_interaction<I: CodexInteraction>(
+    interaction: &mut I,
+    account_name: &str,
+    settings: &MonitorSettings,
+    state: &mut AccountState,
+    overall_deadline: Instant,
+) -> Result<CodexStatus> {
+    let observed_at = Local::now();
+    let pre_anchor = capture_status_triplet(interaction, account_name, settings, overall_deadline)?;
+    let mut status = build_status(
+        account_name,
+        pre_anchor,
+        observed_at,
+        AnchorOutcome::NotNeeded,
+    );
+
+    if !appears_dormant(&status, observed_at, state) {
+        eprintln!("[{account_name}] 5h window already active or cannot be identified as dormant");
+        update_account_state(state, &status, observed_at);
+        eprintln!("[{account_name}] status captured");
+        return Ok(status);
+    }
+
+    eprintln!("[{account_name}] 5h window appears dormant");
+    eprintln!("[{account_name}] sending anchor turn");
+    if let Err(error) = interaction.anchor_turn(settings.model_turn, overall_deadline) {
+        let message = format!("anchor model turn failed: {error:#}");
+        eprintln!("[{account_name}] {message}");
+        status.anchor_outcome = AnchorOutcome::Failed(message);
+        update_account_state(state, &status, observed_at);
+        eprintln!("[{account_name}] using pre-anchor status");
+        return Ok(status);
+    }
+
+    eprintln!("[{account_name}] anchor turn completed");
+    eprintln!("[{account_name}] refreshing post-anchor status");
+    match capture_status_triplet(interaction, account_name, settings, overall_deadline) {
+        Ok(rendered) => {
+            let post_anchor_observed_at = Local::now();
+            let final_status = build_status(
+                account_name,
+                rendered,
+                post_anchor_observed_at,
+                AnchorOutcome::AnchoredAutomatically,
+            );
+            update_account_state(state, &final_status, post_anchor_observed_at);
+            eprintln!("[{account_name}] status captured");
+            Ok(final_status)
+        }
+        Err(error) => {
+            let message = format!("post-anchor status refresh failed: {error:#}");
+            eprintln!("[{account_name}] {message}");
+            status.anchor_outcome = AnchorOutcome::Failed(message);
+            update_account_state(state, &status, observed_at);
+            eprintln!("[{account_name}] using pre-anchor status");
+            Ok(status)
+        }
+    }
+}
+
+fn capture_status_triplet<I: CodexInteraction>(
+    interaction: &mut I,
+    account_name: &str,
+    settings: &MonitorSettings,
+    overall_deadline: Instant,
+) -> Result<String> {
+    let mut authoritative = None;
+    for refresh in 1..=3 {
+        ensure_before(overall_deadline, "overall account monitoring")?;
+        eprintln!("[{account_name}] /status refresh {refresh}/3");
+        let rendered = interaction.status_card(settings.status, overall_deadline)?;
+        if refresh == 3 {
+            authoritative = Some(rendered);
+        } else {
+            sleep_until(settings.refresh_pause, overall_deadline)?;
+        }
+    }
+    authoritative.context("third /status snapshot was not captured")
+}
+
+fn build_status(
+    account_name: &str,
+    rendered_status: String,
+    observed_at: DateTime<Local>,
+    anchor_outcome: AnchorOutcome,
+) -> CodexStatus {
+    CodexStatus {
+        account_name: account_name.to_owned(),
+        five_hour_percent_left: parse_percent_left(&rendered_status, "5h limit:"),
+        weekly_percent_left: parse_percent_left(&rendered_status, "Weekly limit:"),
+        five_hour_reset_at: parse_five_hour_reset(&rendered_status, observed_at),
+        anchor_outcome,
+        rendered_status,
+    }
+}
+
+fn appears_dormant(
+    status: &CodexStatus,
+    observed_at: DateTime<Local>,
+    state: &AccountState,
+) -> bool {
+    if status.five_hour_percent_left != Some(100) {
+        return false;
+    }
+    let Some(reset_at) = status.five_hour_reset_at else {
+        return false;
+    };
+
+    let until_reset = reset_at.signed_duration_since(observed_at);
+    let near_five_hours =
+        until_reset >= ChronoDuration::minutes(295) && until_reset <= ChronoDuration::minutes(305);
+
+    let reset_is_drifting = match (state.previous_five_hour_reset, state.previous_observed_at) {
+        (Some(previous_reset), Some(previous_observed)) => {
+            let wall_clock_advance = observed_at.signed_duration_since(previous_observed);
+            let reset_advance = reset_at.signed_duration_since(previous_reset);
+            wall_clock_advance > ChronoDuration::zero()
+                && reset_advance > ChronoDuration::zero()
+                && (reset_advance - wall_clock_advance).num_seconds().abs() <= 600
+        }
+        _ => false,
+    };
+
+    near_five_hours || reset_is_drifting
+}
+
+fn update_account_state(
+    state: &mut AccountState,
+    status: &CodexStatus,
+    observed_at: DateTime<Local>,
+) {
+    state.previous_five_hour_reset = status.five_hour_reset_at;
+    state.previous_observed_at = Some(observed_at);
 }
 
 fn deadline_for(stage_timeout: Duration, overall_deadline: Instant) -> Instant {
@@ -427,9 +655,112 @@ fn parse_percent_left(status: &str, label: &str) -> Option<u8> {
     digits.parse().ok()
 }
 
+fn parse_five_hour_reset(status: &str, observed_at: DateTime<Local>) -> Option<DateTime<Local>> {
+    let line = status.lines().find(|line| line.contains("5h limit:"))?;
+    let reset_text = line.split_once("resets ")?.1;
+    let reset_text = reset_text.split([')', '│']).next()?.trim();
+
+    let dated_candidate = ["%Y %H:%M on %e %b", "%Y %I:%M %p on %e %b"]
+        .into_iter()
+        .find_map(|format| {
+            NaiveDateTime::parse_from_str(&format!("{} {reset_text}", observed_at.year()), format)
+                .ok()
+        });
+
+    let Some(mut candidate) = dated_candidate else {
+        let time = ["%H:%M", "%I:%M %p"]
+            .into_iter()
+            .find_map(|format| NaiveTime::parse_from_str(reset_text, format).ok())?;
+        let mut candidate = observed_at.date_naive().and_time(time);
+        let initial = local_datetime(candidate)?;
+        if initial < observed_at - ChronoDuration::minutes(5) {
+            candidate = candidate.checked_add_signed(ChronoDuration::days(1))?;
+        }
+        return local_datetime(candidate);
+    };
+
+    let six_months = ChronoDuration::days(183);
+    let initial = local_datetime(candidate)?;
+    if initial < observed_at - six_months {
+        candidate = candidate.with_year(observed_at.year() + 1)?;
+    } else if initial > observed_at + six_months {
+        candidate = candidate.with_year(observed_at.year() - 1)?;
+    }
+    local_datetime(candidate)
+}
+
+fn local_datetime(value: NaiveDateTime) -> Option<DateTime<Local>> {
+    match Local.from_local_datetime(&value) {
+        LocalResult::Single(value) => Some(value),
+        LocalResult::Ambiguous(earliest, _) => Some(earliest),
+        LocalResult::None => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{extract_last_complete_card, parse_percent_left};
+    use std::{
+        collections::VecDeque,
+        time::{Duration, Instant},
+    };
+
+    use anyhow::{Result, bail};
+    use chrono::{Datelike, Local, TimeZone};
+
+    use super::{
+        AccountState, AnchorOutcome, CodexInteraction, MonitorSettings, appears_dormant,
+        build_status, extract_last_complete_card, monitor_interaction, parse_five_hour_reset,
+        parse_percent_left,
+    };
+
+    struct FakeInteraction {
+        cards: VecDeque<String>,
+        status_calls: usize,
+        anchor_calls: usize,
+        anchor_error: bool,
+    }
+
+    impl FakeInteraction {
+        fn new(cards: impl IntoIterator<Item = String>) -> Self {
+            Self {
+                cards: cards.into_iter().collect(),
+                status_calls: 0,
+                anchor_calls: 0,
+                anchor_error: false,
+            }
+        }
+    }
+
+    impl CodexInteraction for FakeInteraction {
+        fn status_card(&mut self, _: Duration, _: Instant) -> Result<String> {
+            self.status_calls += 1;
+            self.cards
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no fake card"))
+        }
+
+        fn anchor_turn(&mut self, _: Duration, _: Instant) -> Result<()> {
+            self.anchor_calls += 1;
+            if self.anchor_error {
+                bail!("fake anchor failure");
+            }
+            Ok(())
+        }
+    }
+
+    fn card(percent: u8, reset: &str, marker: &str) -> String {
+        format!(
+            "╭────╮\n│ Marker: {marker} │\n│ 5h limit: {percent}% left (resets {reset}) │\n╰────╯"
+        )
+    }
+
+    fn test_settings() -> MonitorSettings {
+        MonitorSettings {
+            refresh_pause: Duration::ZERO,
+            overall: Duration::from_secs(10),
+            ..MonitorSettings::default()
+        }
+    }
 
     #[test]
     fn extracts_the_last_complete_box_and_preserves_unknown_rows() {
@@ -458,5 +789,129 @@ mod tests {
         assert_eq!(parse_percent_left(status, "5h limit:"), Some(61));
         assert_eq!(parse_percent_left(status, "Weekly limit:"), Some(7));
         assert_eq!(parse_percent_left(status, "Credits:"), None);
+    }
+
+    #[test]
+    fn parses_reset_time_and_handles_year_rollover() {
+        let december = Local.with_ymd_and_hms(2026, 12, 31, 22, 0, 0).unwrap();
+        let parsed =
+            parse_five_hour_reset("│ 5h limit: 100% left (resets 03:00 on 1 Jan) │", december)
+                .unwrap();
+        assert_eq!(parsed.year(), 2027);
+        assert_eq!(parsed.month(), 1);
+        assert_eq!(parsed.day(), 1);
+    }
+
+    #[test]
+    fn parses_same_day_reset_without_a_date() {
+        let morning = Local.with_ymd_and_hms(2026, 9, 8, 8, 30, 0).unwrap();
+        let parsed =
+            parse_five_hour_reset("│ 5h limit: 100% left (resets 13:30) │", morning).unwrap();
+        assert_eq!(
+            parsed,
+            Local.with_ymd_and_hms(2026, 9, 8, 13, 30, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn dormant_heuristic_requires_full_capacity_for_primary_signal() {
+        let now = Local.with_ymd_and_hms(2026, 9, 8, 8, 0, 0).unwrap();
+        let dormant = build_status(
+            "Main",
+            card(100, "13:00 on 8 Sep", "dormant"),
+            now,
+            AnchorOutcome::NotNeeded,
+        );
+        let active = build_status(
+            "Main",
+            card(99, "13:00 on 8 Sep", "active"),
+            now,
+            AnchorOutcome::NotNeeded,
+        );
+        assert!(appears_dormant(&dormant, now, &AccountState::default()));
+        assert!(!appears_dormant(&active, now, &AccountState::default()));
+    }
+
+    #[test]
+    fn reset_drift_is_additional_dormant_evidence() {
+        let previous_observed = Local.with_ymd_and_hms(2026, 9, 8, 8, 0, 0).unwrap();
+        let now = Local.with_ymd_and_hms(2026, 9, 8, 8, 30, 0).unwrap();
+        let status = build_status(
+            "Main",
+            card(100, "13:20 on 8 Sep", "drifting"),
+            now,
+            AnchorOutcome::NotNeeded,
+        );
+        let state = AccountState {
+            previous_five_hour_reset: Some(Local.with_ymd_and_hms(2026, 9, 8, 12, 50, 0).unwrap()),
+            previous_observed_at: Some(previous_observed),
+        };
+        assert!(appears_dormant(&status, now, &state));
+    }
+
+    #[test]
+    fn active_window_uses_three_statuses_without_anchor() {
+        let cards = (1..=3).map(|index| card(80, "12:00 on 8 Sep", &index.to_string()));
+        let mut fake = FakeInteraction::new(cards);
+        let mut state = AccountState::default();
+        let status = monitor_interaction(
+            &mut fake,
+            "Main",
+            &test_settings(),
+            &mut state,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(fake.status_calls, 3);
+        assert_eq!(fake.anchor_calls, 0);
+        assert!(status.rendered_status.contains("Marker: 3"));
+        assert!(matches!(status.anchor_outcome, AnchorOutcome::NotNeeded));
+    }
+
+    #[test]
+    fn dormant_window_anchors_once_and_reports_post_anchor_third_status() {
+        let reset = (Local::now() + chrono::Duration::hours(5))
+            .format("%H:%M on %-d %b")
+            .to_string();
+        let cards = (1..=6).map(|index| card(100, &reset, &index.to_string()));
+        let mut fake = FakeInteraction::new(cards);
+        let mut state = AccountState::default();
+        let status = monitor_interaction(
+            &mut fake,
+            "Main",
+            &test_settings(),
+            &mut state,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(fake.status_calls, 6);
+        assert_eq!(fake.anchor_calls, 1);
+        assert!(status.rendered_status.contains("Marker: 6"));
+        assert!(matches!(
+            status.anchor_outcome,
+            AnchorOutcome::AnchoredAutomatically
+        ));
+    }
+
+    #[test]
+    fn anchor_failure_returns_best_pre_anchor_status() {
+        let reset = (Local::now() + chrono::Duration::hours(5))
+            .format("%H:%M on %-d %b")
+            .to_string();
+        let mut fake =
+            FakeInteraction::new((1..=3).map(|index| card(100, &reset, &index.to_string())));
+        fake.anchor_error = true;
+        let status = monitor_interaction(
+            &mut fake,
+            "Main",
+            &test_settings(),
+            &mut AccountState::default(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(fake.status_calls, 3);
+        assert_eq!(fake.anchor_calls, 1);
+        assert!(status.rendered_status.contains("Marker: 3"));
+        assert!(matches!(status.anchor_outcome, AnchorOutcome::Failed(_)));
     }
 }

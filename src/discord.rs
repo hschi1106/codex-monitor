@@ -83,10 +83,17 @@ pub fn prepare_account_webhook(
 }
 
 fn status_message_title(status: &crate::codex::CodexStatus) -> String {
-    format!(
+    let mut title = format!(
         "**Codex Usage Monitor — {}**",
         escape_markdown(&status.account_name)
-    )
+    );
+    if let Some(error) = status.anchor_outcome.failure_message() {
+        title.push_str(
+            "\n⚠️ Automatic 5h-window anchor failed; showing the best available status: ",
+        );
+        title.push_str(&escape_markdown(error));
+    }
+    title
 }
 
 fn filename_slug(account_name: &str) -> String {
@@ -110,11 +117,23 @@ fn filename_slug(account_name: &str) -> String {
 
 fn format_account_section(result: &AccountResult) -> String {
     match result {
-        AccountResult::Success(status) => format!(
-            "**{}**\n```text\n{}\n```",
-            escape_markdown(&status.account_name),
-            escape_code_fence(&status.rendered_status)
-        ),
+        AccountResult::Success(status) => {
+            let warning = status
+                .anchor_outcome
+                .failure_message()
+                .map(|error| {
+                    format!(
+                        "⚠️ Automatic 5h-window anchor failed; showing the best available status: {}\n",
+                        escape_markdown(error)
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "**{}**\n{warning}```text\n{}\n```",
+                escape_markdown(&status.account_name),
+                escape_code_fence(&status.rendered_status)
+            )
+        }
         AccountResult::Failure {
             account_name,
             error,
@@ -281,7 +300,7 @@ mod tests {
         DISCORD_LIMIT, format_account_report, format_report, prepare_account_webhook,
         send_prepared_webhook, send_webhook, split_report,
     };
-    use crate::codex::{AccountResult, CodexStatus};
+    use crate::codex::{AccountResult, AnchorOutcome, CodexStatus};
 
     #[test]
     fn report_includes_successes_and_failures() {
@@ -291,6 +310,8 @@ mod tests {
                 rendered_status: "╭──╮\n│ok│\n╰──╯".to_owned(),
                 five_hour_percent_left: Some(50),
                 weekly_percent_left: Some(80),
+                five_hour_reset_at: None,
+                anchor_outcome: AnchorOutcome::NotNeeded,
             }),
             AccountResult::Failure {
                 account_name: "Alt".to_owned(),
@@ -313,12 +334,16 @@ mod tests {
                 rendered_status: "Main status row\n".repeat(60),
                 five_hour_percent_left: None,
                 weekly_percent_left: None,
+                five_hour_reset_at: None,
+                anchor_outcome: AnchorOutcome::NotNeeded,
             }),
             AccountResult::Success(CodexStatus {
                 account_name: "Alt".to_owned(),
                 rendered_status: "Alt status row\n".repeat(60),
                 five_hour_percent_left: None,
                 weekly_percent_left: None,
+                five_hour_reset_at: None,
+                anchor_outcome: AnchorOutcome::NotNeeded,
             }),
         ];
 
@@ -345,6 +370,8 @@ mod tests {
             rendered_status: "╭────────────╮\n│ Model: x   │\n│ 5h limit: 60% left │\n│ Future: yes │\n╰────────────╯".to_owned(),
             five_hour_percent_left: Some(60),
             weekly_percent_left: None,
+            five_hour_reset_at: None,
+            anchor_outcome: AnchorOutcome::NotNeeded,
         });
         let prepared = prepare_account_webhook(
             &Local::now(),
@@ -462,6 +489,8 @@ mod tests {
             rendered_status: "╭─────────────────────────╮\n│ Model: test             │\n│ Future field: preserved │\n╰─────────────────────────╯".to_owned(),
             five_hour_percent_left: None,
             weekly_percent_left: None,
+            five_hour_reset_at: None,
+            anchor_outcome: AnchorOutcome::NotNeeded,
         });
         let prepared = prepare_account_webhook(
             &Local::now(),

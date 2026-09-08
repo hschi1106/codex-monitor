@@ -29,6 +29,7 @@ pub struct MonitorConfig {
     pub terminal_cols: u16,
     pub startup_timeout_seconds: u64,
     pub status_timeout_seconds: u64,
+    pub model_turn_timeout_seconds: u64,
     pub refresh_pause_seconds: u64,
     pub overall_timeout_seconds: u64,
 }
@@ -40,8 +41,9 @@ impl Default for MonitorConfig {
             terminal_cols: 120,
             startup_timeout_seconds: 45,
             status_timeout_seconds: 25,
+            model_turn_timeout_seconds: 90,
             refresh_pause_seconds: 4,
-            overall_timeout_seconds: 150,
+            overall_timeout_seconds: 300,
         }
     }
 }
@@ -53,6 +55,7 @@ impl MonitorConfig {
             terminal_cols: self.terminal_cols,
             startup: Duration::from_secs(self.startup_timeout_seconds),
             status: Duration::from_secs(self.status_timeout_seconds),
+            model_turn: Duration::from_secs(self.model_turn_timeout_seconds),
             refresh_pause: Duration::from_secs(self.refresh_pause_seconds),
             overall: Duration::from_secs(self.overall_timeout_seconds),
         }
@@ -129,6 +132,7 @@ impl AppConfig {
         }
         if self.monitor.startup_timeout_seconds == 0
             || self.monitor.status_timeout_seconds == 0
+            || self.monitor.model_turn_timeout_seconds == 0
             || self.monitor.overall_timeout_seconds == 0
         {
             bail!("monitor timeout values must be greater than zero");

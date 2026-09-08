@@ -5,11 +5,11 @@ mod discord;
 mod scheduler;
 mod status_image;
 
-use std::{path::PathBuf, time::Duration};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use chrono::Local;
-use codex::AccountResult;
+use codex::{AccountResult, AccountState};
 use config::AppConfig;
 
 #[derive(Debug, Clone)]
@@ -60,7 +60,8 @@ async fn main() -> Result<()> {
         .context("failed to create HTTP client")?;
 
     if options.once {
-        run_cycle(&client, &config, options.no_discord).await;
+        let mut account_states = HashMap::new();
+        run_cycle(&client, &config, options.no_discord, &mut account_states).await;
         return Ok(());
     }
 
@@ -69,6 +70,7 @@ async fn main() -> Result<()> {
         options.config_path.display(),
         config.schedule.interval_minutes
     );
+    let mut account_states = HashMap::new();
     loop {
         let next = scheduler::next_boundary(Local::now(), config.schedule.interval_minutes);
         let delay = scheduler::duration_until(next);
@@ -77,11 +79,16 @@ async fn main() -> Result<()> {
             next.format("%Y-%m-%d %H:%M:%S %Z")
         );
         tokio::time::sleep(delay).await;
-        run_cycle(&client, &config, options.no_discord).await;
+        run_cycle(&client, &config, options.no_discord, &mut account_states).await;
     }
 }
 
-async fn run_cycle(client: &reqwest::Client, config: &AppConfig, no_discord: bool) {
+async fn run_cycle(
+    client: &reqwest::Client,
+    config: &AppConfig,
+    no_discord: bool,
+    account_states: &mut HashMap<String, AccountState>,
+) {
     let mut results = Vec::new();
     let settings = config.monitor.settings();
 
@@ -89,13 +96,20 @@ async fn run_cycle(client: &reqwest::Client, config: &AppConfig, no_discord: boo
         let account = account.clone();
         let account_name = account.name.clone();
         let worker_settings = settings.clone();
-        let task =
-            tokio::task::spawn_blocking(move || codex::monitor_account(&account, &worker_settings));
+        let mut account_state = account_states.remove(&account_name).unwrap_or_default();
+        let task = tokio::task::spawn_blocking(move || {
+            let result = codex::monitor_account(&account, &worker_settings, &mut account_state);
+            (result, account_state)
+        });
 
         let result =
             match tokio::time::timeout(settings.overall + Duration::from_secs(5), task).await {
-                Ok(Ok(Ok(status))) => AccountResult::Success(status),
-                Ok(Ok(Err(error))) => {
+                Ok(Ok((Ok(status), state))) => {
+                    account_states.insert(account_name.clone(), state);
+                    AccountResult::Success(status)
+                }
+                Ok(Ok((Err(error), state))) => {
+                    account_states.insert(account_name.clone(), state);
                     eprintln!("[{account_name}] failed: {error:#}");
                     AccountResult::Failure {
                         account_name,
@@ -143,6 +157,7 @@ async fn run_cycle(client: &reqwest::Client, config: &AppConfig, no_discord: boo
 
     let mut message_number = 0;
     for result in &results {
+        let account_name = result.account_name().to_owned();
         match discord::prepare_account_webhook(
             &timestamp,
             result,
@@ -154,7 +169,11 @@ async fn run_cycle(client: &reqwest::Client, config: &AppConfig, no_discord: boo
                 if let Err(error) =
                     discord::send_prepared_webhook(client, &webhook_url, message).await
                 {
-                    eprintln!("Discord message {message_number} failed: {error:#}");
+                    eprintln!(
+                        "[{account_name}] Discord message {message_number} failed: {error:#}"
+                    );
+                } else {
+                    eprintln!("[{account_name}] Discord report sent");
                 }
             }
             Err(error) => {
@@ -164,7 +183,11 @@ async fn run_cycle(client: &reqwest::Client, config: &AppConfig, no_discord: boo
                     message_number += 1;
                     if let Err(error) = discord::send_webhook(client, &webhook_url, &message).await
                     {
-                        eprintln!("Discord fallback message {message_number} failed: {error:#}");
+                        eprintln!(
+                            "[{account_name}] Discord fallback message {message_number} failed: {error:#}"
+                        );
+                    } else {
+                        eprintln!("[{account_name}] Discord report sent");
                     }
                 }
             }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/hschi1106/codex-monitor"
-description = "Monitor multiple local Codex CLI accounts and report their rendered status to Discord"
+description = "Anchor dormant Codex usage windows and report multi-account status to Discord"
 
 [dependencies]
 ab_glyph = "0.2"

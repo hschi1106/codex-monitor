@@ -7,13 +7,15 @@
   <a href="https://github.com/hschi1106/codex-monitor/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/hschi1106/codex-monitor"></a>
 </p>
 
-Monitor `/status` across multiple local Codex CLI accounts and deliver complete,
-readable status cards to Discord.
+Keep dormant Codex 5-hour usage windows anchored across multiple local accounts,
+while delivering complete, readable `/status` cards to Discord.
 
 Codex `/status` is an interactive TUI command rather than ordinary command
 output. Codex Usage Monitor opens a real pseudo-terminal, waits for the TUI,
 runs `/status` three times in the same session, reconstructs the terminal with
-a VT100 parser, and treats the complete third card as the authoritative result.
+a VT100 parser, and treats the complete third card as authoritative. When a
+fully available 5-hour window still appears unanchored, it sends one minimal
+real model turn and captures three fresh status cards before reporting.
 
 Each successful account produces one Discord message containing:
 
@@ -30,20 +32,20 @@ incoming webhook.
 
 ## Why this exists
 
-Codex's displayed 5-hour limit can remain stale after its stated reset time,
-especially when an account has been idle. In observed use, opening Codex again
-can trigger an asynchronous refresh before the restored capacity becomes
-visible.
+This project is more than a passive usage dashboard. An idle account at 100%
+can show a reset timestamp that remains about five hours ahead and moves forward
+with wall-clock time. In observed Codex CLI behavior, that suggests the next
+5-hour window has not been anchored by a real model turn.
 
-Codex Usage Monitor handles that behavior proactively. On every scheduled
-cycle it opens each account, runs `/status` three times in the same session with
-refresh pauses in between, and records only the final rendered card. Combined
-with the default `HH:00` and `HH:30` schedule, the service both monitors
-remaining capacity and regularly triggers a usage-state refresh for otherwise
-idle accounts.
+Every cycle first captures an authoritative status with three `/status` calls.
+If the account is at 100% and its reset is approximately five hours away, the
+monitor sends one tiny `Reply only OK. Do not use tools.` request, waits for the
+model response to finish, then captures `/status` three more times. Discord
+receives the final post-anchor card. Active windows skip the model request but
+are still reported.
 
-This is particularly useful with multiple accounts because they stay refreshed
-without manually opening each Codex session.
+The default `HH:00` and `HH:30` schedule keeps each configured account checked
+and anchors a dormant window without manually opening Codex.
 
 > [!IMPORTANT]
 > This workaround is based on observed Codex CLI behavior, not a documented or
@@ -56,6 +58,9 @@ without manually opening each Codex session.
 - Invoke the real `codex` executable without shell aliases
 - Reconstruct full-screen TUI output instead of stripping raw ANSI bytes
 - Run three `/status` refreshes in one session to avoid stale rate-limit data
+- Detect a likely dormant 5-hour window from 100% remaining and reset time
+- Anchor a dormant window with exactly one minimal real model turn
+- Refresh `/status` three more times and report the post-anchor third card
 - Preserve every visible status row, including future unknown fields
 - Isolate account failures so one timeout does not suppress other results
 - Enforce startup, status, HTTP, and overall account timeouts
@@ -66,19 +71,24 @@ without manually opening each Codex session.
 ## How it works
 
 ```text
-Configured accounts
+Codex TUI in a PTY
         │
         ▼
-Codex TUI in a PTY ── /status × 3 in one session
+/status × 3 → complete third card → parse 5h state
         │
-        ▼
-VT100 screen reconstruction
-        │
-        ▼
-Complete third status card
-        │
-        ├── Clean local report
-        └── Discord title + PNG + TXT
+        ├── active ───────────────────────────────┐
+        │                                         │
+        └── likely dormant                        │
+                │                                 │
+                ▼                                 │
+        one minimal model turn                    │
+                │                                 │
+                ▼                                 │
+        /status × 3 → post-anchor third card      │
+                │                                 │
+                └─────────────────────────────────┘
+                                                  ▼
+                                      local report + Discord PNG/TXT
 ```
 
 ## Requirements
@@ -128,7 +138,9 @@ CODEX_HOME=/home/hschi1106/.codex-alt codex
 ./target/release/codex-monitor --config config.toml --once --no-discord
 ```
 
-The command immediately checks every account, prints a clean report, and exits.
+The command immediately checks every account, anchors any detected dormant
+window, prints a clean report, and exits. `--no-discord` disables only the HTTP
+request; it does not disable automatic anchoring.
 
 ### 4. Connect Discord
 
@@ -184,8 +196,9 @@ terminal_rows = 80
 terminal_cols = 120
 startup_timeout_seconds = 45
 status_timeout_seconds = 25
+model_turn_timeout_seconds = 90
 refresh_pause_seconds = 4
-overall_timeout_seconds = 150
+overall_timeout_seconds = 300
 
 [schedule]
 interval_minutes = 30
@@ -227,10 +240,14 @@ account should normally override `CODEX_HOME`.
 | `terminal_cols` | `120` | Columns in the virtual terminal; minimum 60 |
 | `startup_timeout_seconds` | `45` | Maximum time to wait for the real TUI prompt |
 | `status_timeout_seconds` | `25` | Maximum time for each rendered `/status` card |
+| `model_turn_timeout_seconds` | `90` | Maximum time for the minimal anchor model turn |
 | `refresh_pause_seconds` | `4` | Pause for asynchronous rate-limit refreshes between calls |
-| `overall_timeout_seconds` | `150` | Hard deadline for one account session |
+| `overall_timeout_seconds` | `300` | Hard deadline for initial capture, optional anchor, and recapture |
 
-The three `/status` invocations are intentionally fixed and cannot be reduced.
+The three initial `/status` invocations are intentionally fixed. A likely
+dormant account receives exactly one model request followed by another fixed
+set of three `/status` calls. A model-turn failure is reported, and the best
+available pre-anchor card is still delivered.
 
 ### Schedule
 
@@ -286,8 +303,20 @@ Normal progress logs look like this:
 [Main] /status refresh 1/3
 [Main] /status refresh 2/3
 [Main] /status refresh 3/3
+[Main] 5h window appears dormant
+[Main] sending anchor turn
+[Main] anchor turn completed
+[Main] refreshing post-anchor status
+[Main] /status refresh 1/3
+[Main] /status refresh 2/3
+[Main] /status refresh 3/3
 [Main] status captured
+[Main] Discord report sent
 ```
+
+For an active window, the monitor logs `5h window already active` and skips the
+model request. Discord reporting still occurs on every cycle, including when
+another account fails.
 
 Raw PTY escape sequences are never printed to the real terminal.
 
